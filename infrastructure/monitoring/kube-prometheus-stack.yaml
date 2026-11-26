@@ -1,0 +1,272 @@
+# kube-prometheus-stack, slimmed for 2 x 6 GB nodes:
+#   Prometheus (3 days, emptyDir), Alertmanager, node-exporter,
+#   kube-state-metrics, the operator. No Grafana: Grafana Cloud is the UI.
+# Not scraped (managed by Oracle or not worth the memory): etcd, scheduler,
+# controller-manager, kube-proxy, CoreDNS, the API server.
+#
+# Metrics leave the cluster ONE way per backend: the otel-gateway collector
+# (otel-gateway.yaml) reads a chosen subset from this Prometheus (/federate)
+# and sends it to Grafana Cloud and to New Relic. No remote_write here, so
+# nothing is ingested twice.
+#
+# Alerts: Alertmanager -> ntfy.example.com topic "monitor" (your phone; the
+# failover Worker sends it to apps/ntfy-standby when Home is down) and,
+# silently (priority 1), to the ChatOps ntfy topic "${NTFY_TOPIC}" over the
+# tailnet, so the cluster channel keeps a log without a second buzz.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kube-prometheus-stack
+  namespace: monitoring
+spec:
+  interval: 1h
+  releaseName: kube-prometheus-stack
+  timeout: 10m
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      # The chart takes a new major often; a new one is a one-line PR.
+      version: "92.x"
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    grafana:
+      enabled: false
+    windowsMonitoring:
+      enabled: false
+    kubeEtcd:
+      enabled: false
+    kubeScheduler:
+      enabled: false
+    kubeControllerManager:
+      enabled: false
+    kubeProxy:
+      enabled: false
+    coreDns:
+      enabled: false
+    kubeDns:
+      enabled: false
+    kubeApiServer:
+      enabled: false
+
+    defaultRules:
+      rules:
+        etcd: false
+        kubeApiserverAvailability: false
+        kubeApiserverBurnrate: false
+        kubeApiserverHistogram: false
+        kubeApiserverSlos: false
+        kubeControllerManager: false
+        kubeProxy: false
+        kubeSchedulerAlerting: false
+        kubeSchedulerRecording: false
+        windows: false
+      # These read API server metrics, which are not scraped (see above);
+      # KubeAPIDown would fire for ever.
+      disabled:
+        KubeAPIDown: true
+        KubeAPIInstanceUnreachable: true
+        KubeAPITerminatedRequests: true
+        KubeAggregatedAPIDown: true
+        KubeAggregatedAPIErrors: true
+        # NOT disabled on purpose: it reads API server metrics (never fires here), but disabling all six
+        # leaves the group kubernetes-system-apiserver with no rules and the chart (92.22.0) renders
+        # "rules: null", which Kubernetes rejects (install failed, 4 attempts).
+
+    # The one rule the owner asked for: root filesystem of a node.
+    # 50 GB boot volumes (oracle-always-free node_boot_volume_gb).
+    additionalPrometheusRulesMap:
+      node-disk:
+        groups:
+          - name: node-disk
+            rules:
+              - alert: NodeDiskLow
+                expr: node_filesystem_avail_bytes{mountpoint="/", fstype!~"tmpfs|overlay|squashfs"} < 10e9
+                for: 15m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: "Node {{ $labels.instance }}: less than 10 GB free on /"
+                  description: "{{ $value | humanize1024 }}B free on / of {{ $labels.instance }}. Look at images (crictl rmi --prune) and local-path volumes."
+              - alert: NodeDiskLow
+                expr: node_filesystem_avail_bytes{mountpoint="/", fstype!~"tmpfs|overlay|squashfs"} < 5e9
+                for: 5m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: "Node {{ $labels.instance }}: less than 5 GB free on /"
+                  description: "{{ $value | humanize1024 }}B free on / of {{ $labels.instance }}. Pods get evicted soon (kubelet disk pressure)."
+
+    alertmanager:
+      alertmanagerSpec:
+        # Mounted at /etc/alertmanager/secrets/alertmanager-ntfy/<key>
+        secrets:
+          - alertmanager-ntfy
+        retention: 120h
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        nodeSelector:
+          kubernetes.io/arch: arm64
+      config:
+        global:
+          resolve_timeout: 5m
+        inhibit_rules:
+          # critical hides warning of the same alert on the same target
+          # (NodeDiskLow < 5 GB hides NodeDiskLow < 10 GB of that node only).
+          - source_matchers: ['severity = critical']
+            target_matchers: ['severity =~ warning|info']
+            equal: ['namespace', 'alertname', 'instance']
+          - source_matchers: ['severity = warning']
+            target_matchers: ['severity = info']
+            equal: ['namespace', 'alertname', 'instance']
+          - source_matchers: ['alertname = InfoInhibitor']
+            target_matchers: ['severity = info']
+            equal: ['namespace']
+          - target_matchers: ['alertname = InfoInhibitor']
+        route:
+          receiver: ntfy
+          group_by: ['alertname', 'namespace']
+          group_wait: 30s
+          group_interval: 5m
+          repeat_interval: 12h
+          routes:
+            - receiver: "null"
+              matchers: ['alertname = "Watchdog"']
+            - receiver: "null"
+              matchers: ['alertname = "InfoInhibitor"']
+            - receiver: "null"
+              matchers: ['severity = "none"']
+        receivers:
+          - name: "null"
+          - name: ntfy
+            webhook_configs:
+              # Phone: the public ntfy, topic alerts (everything that is
+              # broken now, layout of 21 Nov 2026), ntfy's built-in
+              # Alertmanager template (ntfy >= 2.14). The failover Worker
+              # (cloudflare-free) answers from the cluster standby when
+              # Home is down, so this still arrives then. Same bot token
+              # (it may publish to every topic).
+              - url: https://ntfy.${BASE_DOMAIN}/alerts?template=alertmanager
+                send_resolved: true
+                http_config:
+                  authorization:
+                    type: Bearer
+                    credentials_file: /etc/alertmanager/secrets/alertmanager-ntfy/NTFY_TOKEN
+              # Old topic monitor, kept for the 7-day parallel period so no
+              # alert is lost while the phone moves to alerts.
+              # TODO 2026-11-28: remove this webhook (topic monitor retires).
+              - url: https://ntfy.${BASE_DOMAIN}/monitor?template=alertmanager
+                send_resolved: true
+                http_config:
+                  authorization:
+                    type: Bearer
+                    credentials_file: /etc/alertmanager/secrets/alertmanager-ntfy/NTFY_TOKEN
+              # ChatOps: private ntfy over the tailnet (egress Service
+              # tailscale/ntfy-home). The certificate is for the tailnet
+              # name, so TLS asks for that name (SNI), which is also what
+              # Tailscale serve routes on. priority=1: listed in the channel,
+              # no notification (the phone already got the ones above).
+              # Tag chatops: the ChatOps listener never reads it as a command.
+              - url: https://ntfy-home.tailscale.svc.cluster.local/${NTFY_TOPIC}?template=alertmanager&priority=1&tags=chatops
+                send_resolved: true
+                http_config:
+                  authorization:
+                    type: Bearer
+                    credentials_file: /etc/alertmanager/secrets/alertmanager-ntfy/CHATOPS_NTFY_TOKEN
+                  tls_config:
+                    server_name: ${HOME_TAILNET_FQDN}
+
+    prometheusOperator:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      prometheusConfigReloader:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+          limits:
+            cpu: 50m
+            memory: 64Mi
+      admissionWebhooks:
+        patch:
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          nodeSelector:
+            kubernetes.io/arch: arm64
+
+    prometheus:
+      prometheusSpec:
+        retention: 3d
+        retentionSize: 3GB
+        scrapeInterval: 60s
+        evaluationInterval: 60s
+        externalLabels:
+          cluster: ${CLUSTER_NAME}
+        # Pick up ServiceMonitors/PodMonitors/rules of every chart, not only
+        # this release's.
+        serviceMonitorSelectorNilUsesHelmValues: false
+        podMonitorSelectorNilUsesHelmValues: false
+        ruleSelectorNilUsesHelmValues: false
+        probeSelectorNilUsesHelmValues: false
+        # emptyDir, not a PVC: 3 days of local history only; the long view
+        # is in Grafana Cloud. A reschedule starts empty, which is fine.
+        storageSpec:
+          emptyDir:
+            sizeLimit: 4Gi
+        resources:
+          requests:
+            cpu: 20m
+            memory: 400Mi
+          limits:
+            cpu: "1"
+            memory: 1200Mi
+        nodeSelector:
+          kubernetes.io/arch: arm64
+
+    kube-state-metrics:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 48Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+      nodeSelector:
+        kubernetes.io/arch: arm64
+
+    prometheus-node-exporter:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 24Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi

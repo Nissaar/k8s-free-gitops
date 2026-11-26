@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - allowed-registries.yaml
+  - disallow-privileged.yaml
+  - require-requests-limits.yaml
+patches:
+  # ---------------------------------------------------------------------
+  # THE ONE SWITCH. All policies report only (Audit) until you change
+  # [Audit] to [Deny] below. Before switching, check that nothing would be
+  # blocked:   kubectl get policyreports -A   (docs/WHAT-YOU-DO.md step 14)
+  # ---------------------------------------------------------------------
+  - target:
+      group: policies.kyverno.io
+      kind: ValidatingPolicy
+    patch: |
+      - op: replace
+        path: /spec/validationActions
+        value: [Audit]

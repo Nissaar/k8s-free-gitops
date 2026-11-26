@@ -1,0 +1,61 @@
+# Tailscale Kubernetes operator.
+# - Joins the tailnet as "oke-free" (tag:k8s-operator) and runs the API server
+#   proxy in auth mode: kubectl over the tailnet, identities mapped to
+#   Kubernetes users/groups by tailnet grants (docs/WHAT-YOU-DO.md).
+# - Proxies it creates (egress to Home's ntfy) get
+#   tag:k8s and the ProxyClass "small" (infrastructure/configs/tailscale).
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: tailscale-operator
+  namespace: tailscale
+spec:
+  interval: 1h
+  releaseName: tailscale-operator
+  chart:
+    spec:
+      chart: tailscale-operator
+      version: "1.x"
+      sourceRef:
+        kind: HelmRepository
+        name: tailscale
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    # Empty oauth block: the chart then mounts the precreated Secret
+    # tailscale/operator-oauth (client_id, client_secret), made by External
+    # Secrets from OCI Vault (operator-oauth.externalsecret.yaml).
+    oauth: {}
+    operatorConfig:
+      # CRI-O here refuses short image names: spell out the registry.
+      image:
+        repository: docker.io/tailscale/k8s-operator
+      hostname: oke-free
+      defaultTags:
+        - "tag:k8s-operator"
+      logging: info
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: arm64
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    proxyConfig:
+      image:
+        repository: docker.io/tailscale/tailscale
+      defaultTags: "tag:k8s"
+      defaultProxyClass: small
+    apiServerProxyConfig:
+      mode: "true"

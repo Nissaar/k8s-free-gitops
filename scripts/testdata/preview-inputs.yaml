@@ -1,0 +1,21 @@
+# Mock pull-request inputs for `flux-operator build resourceset` (validate.sh):
+# what a GitHubPullRequest provider exports, merged with its defaultValues.
+- id: "42"
+  sha: bf5d6e01cf802734853f6f3417b237e3ad0ba35d
+  branch: feat/test
+  author: <your-github-user>
+  title: testing
+  app: myapp
+  image: ghcr.io/your-github-user/myapp
+  port: 8080
+  healthPath: /healthz
+- id: "7"
+  sha: 0123456789abcdef0123456789abcdef01234567
+  branch: fix/login
+  author: <your-github-user>
+  title: other app
+  app: otherapp
+  image: ghcr.io/your-github-user/otherapp
+  port: "3000"
+  healthPath: /
+  expectStatus: "302"

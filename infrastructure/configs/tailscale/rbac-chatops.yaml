@@ -1,0 +1,74 @@
+# What the Home ChatOps bot may do through the API server proxy
+# (tailnet grant -> Kubernetes group "chatops", docs/WHAT-YOU-DO.md step 12;
+# <home-server-repo>/ops/README.md "cluster" channel):
+# read everything except Secrets, restart deployments (krestart = patch),
+# suspend/resume Kustomizations and reconcile HelmReleases (patch).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chatops
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "storage.k8s.io"]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - services
+      - endpoints
+      - configmaps
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+      - jobs
+      - cronjobs
+      - ingresses
+      - storageclasses
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources: [gitrepositories, helmrepositories, helmcharts, ocirepositories, buckets]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: [kustomizations]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: [helmreleases]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["image.toolkit.fluxcd.io"]
+    resources: [imagerepositories, imagepolicies, imageupdateautomations]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["fluxcd.controlplane.io"]
+    resources: [fluxinstances, fluxreports, resourcesets, resourcesetinputproviders]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["aquasecurity.github.io"]
+    resources: [vulnerabilityreports, configauditreports]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["wgpolicyk8s.io"]
+    resources: [policyreports, clusterpolicyreports]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["openreports.io"]
+    resources: [reports, clusterreports]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policies.kyverno.io"]          # a chat bot can show each policy's mode (Audit or Deny)
+    resources: [validatingpolicies]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chatops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chatops
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: chatops

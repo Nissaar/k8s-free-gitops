@@ -1,0 +1,142 @@
+# Scripts for the weekly restore test (cronjob.yaml). One pod, four steps that
+# share the emptyDir /work:
+#   1. restore  (init, restic)   newest "home" snapshot with /nocobase/nocobase.sql.gz -> /work
+#   2. postgres (sidecar)        throwaway Postgres on 127.0.0.1, data in emptyDir
+#   3. check    (postgres image) load the dump, run sanity queries -> /work/result
+#   4. report   (curl)           wait for /work/result, ntfy + healthchecks.io, clean /work
+# Steps 1 and 3 never fail silently: they write what went wrong for step 4.
+# The scripts use $VAR only, never ${VAR} (Flux postBuild would substitute it).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restore-test-scripts
+  namespace: restore-test
+  labels:
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+data:
+  restore.sh: |
+    #!/bin/sh
+    # Find the newest snapshot that holds the NocoBase dump and restore that file.
+    W=/work
+    date +%s > $W/t0   # start of the recovery clock (the DR drill reports it)
+    export RESTIC_CACHE_DIR=$W/restic-cache
+    fail() { echo "$1" > $W/restic.error; echo "ERROR: $1"; exit 0; }
+
+    # --no-lock on every command: this job uses a READ-ONLY R2 key (Object Read only, bucket backups), and
+    # restic otherwise tries to write a lock file into the repository ("client.PutObject: Access Denied").
+    # The Home backup writes its snapshots with host "home" (RESTIC_HOST).
+    restic snapshots --no-lock --host "$RESTIC_HOST" --json > $W/snapshots.json 2> $W/restic.log \
+      || fail "restic snapshots failed: $(tail -n 3 $W/restic.log)"
+    # short ids, oldest first -> newest first, try the 10 newest
+    ids=$(grep -o '"short_id":"[0-9a-f]*"' $W/snapshots.json | cut -d'"' -f4 | sed -n '1!G;h;$p' | head -n 10)
+    [ -n "$ids" ] || fail "repository has no snapshots of host $RESTIC_HOST"
+    for id in $ids; do
+      path=$(restic ls --no-lock "$id" 2>> $W/restic.log | grep -E "(^|/)$DUMP_PATH\$" | head -n 1)
+      if [ -n "$path" ]; then
+        echo "snapshot $id has $path"
+        restic restore --no-lock "$id" --target $W/restore --include "$path" >> $W/restic.log 2>&1 \
+          || fail "restic restore $id failed: $(tail -n 3 $W/restic.log)"
+        mv "$W/restore$path" $W/nocobase.sql.gz || fail "restored file missing at $path"
+        gzip -t $W/nocobase.sql.gz || fail "dump from snapshot $id is not valid gzip"
+        when=$(restic snapshots --no-lock "$id" --json 2>/dev/null | grep -o '"time":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+        echo "$id $when" > $W/snapshot.txt
+        rm -rf $W/restore $W/restic-cache
+        echo "restored $(du -h $W/nocobase.sql.gz | cut -f1) from snapshot $id ($when)"
+        exit 0
+      fi
+    done
+    fail "none of the 10 newest snapshots contains $DUMP_PATH"
+
+  check.sh: |
+    #!/bin/sh
+    # Load the dump into the sidecar Postgres and run sanity queries.
+    W=/work
+    result() { # PASS|FAIL message
+      printf '%s\n%s\n' "$1" "$2" > $W/result.tmp && mv $W/result.tmp $W/result
+      echo "$1: $2"
+      [ "$1" = PASS ] && exit 0
+      exit 1
+    }
+    [ -f $W/restic.error ] && result FAIL "restore step: $(cat $W/restic.error)"
+    [ -f $W/nocobase.sql.gz ] || result FAIL "restore step produced no dump"
+    snap=$(cat $W/snapshot.txt)
+
+    export PGHOST=127.0.0.1 PGUSER=postgres
+    for _ in $(seq 60); do pg_isready -q && break; sleep 2; done
+    pg_isready -q || result FAIL "throwaway Postgres did not start"
+
+    # Roles the dump assigns ownership to, so OWNER TO lines do not fail.
+    for r in $DB_ROLES; do psql -q -d postgres -c "CREATE ROLE \"$r\"" > /dev/null 2>&1; done
+
+    gunzip -c $W/nocobase.sql.gz | psql -q -d postgres -v ON_ERROR_STOP=0 > $W/load.log 2>&1
+    errors=$(grep -c 'ERROR' $W/load.log)
+    rm -f $W/nocobase.sql.gz
+
+    # pg_dump -C dumps switch to their own database; plain dumps load into postgres.
+    db=postgres
+    psql -Atq -d postgres -c "select 1 from pg_database where datname = '$DB_NAME'" | grep -q 1 && db=$DB_NAME
+    psql -q -d "$db" -c ANALYZE > /dev/null 2>&1
+
+    tables=$(psql -Atq -d "$db" -c "select count(*) from information_schema.tables
+      where table_type = 'BASE TABLE' and table_schema not in ('pg_catalog', 'information_schema')")
+    [ "$tables" -gt 0 ] 2>/dev/null || result FAIL "snapshot $snap: no tables after loading the dump ($errors psql errors; first: $(grep -m1 ERROR $W/load.log))"
+
+    # Newest row of a big table: CHECK_TABLE/CHECK_COLUMN if set, else the
+    # largest table that has an updatedAt/createdAt timestamp column.
+    if [ -n "$CHECK_TABLE" ]; then
+      filter="c.table_name = '$CHECK_TABLE' and c.column_name = '$CHECK_COLUMN'"
+    else
+      filter="c.column_name in ('updatedAt', 'updated_at', 'createdAt', 'created_at')"
+    fi
+    pick=$(psql -Atq -F '|' -d "$db" -c "
+      select format('select coalesce(floor(extract(epoch from now() - max(%I)) / 3600), -1)::bigint from %I.%I',
+                    c.column_name, c.table_schema, c.table_name),
+             c.table_schema || '.' || c.table_name || '.' || c.column_name,
+             s.n_live_tup
+      from information_schema.columns c
+      join pg_stat_user_tables s on s.schemaname = c.table_schema and s.relname = c.table_name
+      where $filter and c.data_type like 'timestamp%' and s.n_live_tup > 0
+      order by s.n_live_tup desc, (c.column_name in ('updatedAt', 'updated_at')) desc
+      limit 1")
+    [ -n "$pick" ] || result FAIL "snapshot $snap: $tables tables, but no non-empty table with a timestamp column to check ($errors psql errors)"
+    query=$(echo "$pick" | cut -d'|' -f1)
+    label=$(echo "$pick" | cut -d'|' -f2)
+    rows=$(echo "$pick" | cut -d'|' -f3)
+    age=$(psql -Atq -d "$db" -c "$query")
+    [ "$age" -ge 0 ] 2>/dev/null || result FAIL "snapshot $snap: could not read the newest row of $label"
+    summary="snapshot $snap: $tables tables; newest row of $label (~$rows rows) is $age h old (limit $MAX_AGE_HOURS h); $errors psql errors while loading"
+    [ "$age" -le "$MAX_AGE_HOURS" ] || result FAIL "$summary"
+    result PASS "$summary"
+
+  report.sh: |
+    #!/bin/sh
+    # Wait for the check, then report to ntfy (tailnet) and healthchecks.io.
+    W=/work
+    for _ in $(seq 270); do [ -f $W/result ] && break; sleep 10; done
+    if [ -f $W/result ]; then
+      status=$(sed -n 1p $W/result)
+      msg=$(sed -n '2,$p' $W/result)
+    else
+      status=FAIL
+      msg="no result after 45 min: the check container crashed or hung (kubectl -n restore-test logs job/<name> -c check)"
+    fi
+    echo "$status: $msg"
+
+    if [ -n "$NTFY_HOST" ] && [ -n "$NTFY_TOKEN" ]; then
+      if [ "$status" = PASS ]; then prio=2; tag=white_check_mark; else prio=4; tag=x; fi
+      # Tag "chatops" so the ChatOps listener does not read it as a command.
+      curl -sS -o /dev/null --max-time 20 \
+        --connect-to "$NTFY_HOST:443:$NTFY_VIA:443" \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: Restore test $status (NocoBase from restic/home)" \
+        -H "Priority: $prio" -H "Tags: chatops,$tag" \
+        -d "$msg" "https://$NTFY_HOST/$NTFY_TOPIC" || echo "ntfy post failed"
+    fi
+    if [ -n "$HEALTHCHECK_URL" ]; then
+      url=$HEALTHCHECK_URL
+      [ "$status" = PASS ] || url="$HEALTHCHECK_URL/fail"
+      curl -sS -o /dev/null --max-time 20 --retry 3 -d "$msg" "$url" || echo "healthchecks ping failed"
+    fi
+    # Clean up: nothing of the dump or the database is left behind.
+    rm -rf $W/* 2>/dev/null
+    [ "$status" = PASS ]

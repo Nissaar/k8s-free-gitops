@@ -1,0 +1,71 @@
+# External Secrets Operator: turns ExternalSecret objects into Kubernetes
+# Secrets, reading OCI Vault through the ClusterSecretStore "oci-vault"
+# (infrastructure/controllers/secret-store). One Vault secret per Kubernetes
+# Secret, named <namespace>-<secret>, JSON body = the Secret's keys.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: external-secrets
+  namespace: external-secrets
+spec:
+  interval: 1h
+  releaseName: external-secrets
+  chart:
+    spec:
+      chart: external-secrets
+      version: "2.x"
+      sourceRef:
+        kind: HelmRepository
+        name: external-secrets
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    installCRDs: true
+    # Image: the chart's default (ghcr.io/external-secrets/external-secrets,
+    # tag = chart appVersion), so it moves with the chart range above.
+    concurrent: 1
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 192Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    webhook:
+      resources:
+        requests:
+          cpu: 5m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 96Mi
+      nodeSelector:
+        kubernetes.io/arch: arm64
+    certController:
+      resources:
+        requests:
+          cpu: 5m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+      nodeSelector:
+        kubernetes.io/arch: arm64

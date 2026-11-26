@@ -1,0 +1,116 @@
+# Scripts for the monthly DR drill (dr-drill.yaml). Same pod pattern as the
+# weekly restore test, one step further: production versions, then NocoBase.
+#   1. restore  (init, restic)        restore.sh from restore-test-scripts
+#   2. postgres (sidecar, 16-alpine)  same major as production NocoBase
+#   3. nocobase (sidecar)             waits for the data, then starts NocoBase
+#   4. load     (postgres 16-alpine)  dump -> database nocobase, ON_ERROR_STOP=1
+#   5. report   (curl)                waits for /api/__health_check = 200,
+#                                     ntfy + healthchecks.io, cleans /work
+# $VAR only, never ${VAR}: Flux postBuild would substitute it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-drill-scripts
+  namespace: restore-test
+  labels:
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+data:
+  load.sh: |
+    #!/bin/sh
+    # Load the dump exactly as a rebuild would: PG16, database and owner
+    # "nocobase", stop at the first error.
+    W=/work
+    fail() {
+      printf 'FAIL\n%s\n' "$1" > $W/result.tmp && mv $W/result.tmp $W/result
+      echo "FAIL: $1"; exit 1
+    }
+    [ -f $W/restic.error ] && fail "restore step: $(cat $W/restic.error)"
+    [ -f $W/nocobase.sql.gz ] || fail "restore step produced no dump"
+    export PGHOST=127.0.0.1
+    for _ in $(seq 60); do pg_isready -q -U postgres && break; sleep 2; done
+    pg_isready -q -U postgres || fail "PostgreSQL 16 did not start"
+
+    pass=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
+      -c "CREATE ROLE nocobase LOGIN SUPERUSER PASSWORD '$pass'" \
+      -c "CREATE DATABASE nocobase OWNER nocobase" > $W/load.log 2>&1 \
+      || fail "could not create role/database: $(tail -n 2 $W/load.log)"
+
+    # pg_dump 18 writes "SET transaction_timeout", which PostgreSQL 16 rejects.
+    if ! gzip -dc $W/nocobase.sql.gz | grep -v '^SET transaction_timeout' \
+         | PGPASSWORD=$pass psql -U nocobase -d nocobase -q -v ON_ERROR_STOP=1 >> $W/load.log 2>&1; then
+      fail "psql stopped at the first error: $(grep -m1 -E 'ERROR|error' $W/load.log)"
+    fi
+    rm -f $W/nocobase.sql.gz
+    tables=$(psql -U nocobase -d nocobase -Atq -c "select count(*) from information_schema.tables
+      where table_type = 'BASE TABLE' and table_schema not in ('pg_catalog', 'information_schema')")
+    [ "$tables" -gt 0 ] 2>/dev/null || fail "no tables after loading the dump"
+    echo "$tables" > $W/tables
+    printf '%s' "$pass" > $W/dbpass
+    date +%s > $W/loaded.tmp && mv $W/loaded.tmp $W/loaded
+    echo "loaded $tables tables into PostgreSQL 16"
+
+  nocobase.sh: |
+    #!/bin/sh
+    # Start NocoBase on the restored database, with a fresh random APP_KEY.
+    W=/work
+    while [ ! -f $W/loaded ] && [ ! -f $W/result ]; do sleep 5; done
+    if [ -f $W/result ]; then
+      echo "the load failed; NocoBase is not started"
+      exec sleep 86400
+    fi
+    DB_PASSWORD=$(cat $W/dbpass)
+    APP_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    export DB_PASSWORD APP_KEY
+    exec /app/docker-entrypoint.sh
+
+  report.sh: |
+    #!/bin/sh
+    # Wait for the load, then for NocoBase's health check, then report.
+    W=/work
+    t0=$(cat $W/t0 2>/dev/null || date +%s)
+    mins() { echo "$(( $1 / 60 ))m$(( $1 % 60 ))s"; }
+    for _ in $(seq 240); do [ -f $W/loaded ] || [ -f $W/result ] && break; sleep 10; done
+
+    if [ -f $W/result ]; then
+      status=$(sed -n 1p $W/result); msg=$(sed -n '2,$p' $W/result)
+    elif [ ! -f $W/loaded ]; then
+      status=FAIL; msg="the dump was not loaded within 40 min"
+    else
+      loaded=$(cat $W/loaded)
+      deadline=$((loaded + HEALTH_TIMEOUT_SECONDS))
+      code=000
+      while [ "$(date +%s)" -lt "$deadline" ]; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || echo 000)
+        [ "$code" = 200 ] && break
+        sleep 10
+      done
+      now=$(date +%s)
+      data="data restored and loaded in $(mins $((loaded - t0))) ($(cat $W/tables) tables, PostgreSQL 16)"
+      if [ "$code" = 200 ]; then
+        status=PASS
+        msg="$data; NocoBase healthy $(mins $((now - loaded))) later. Recovery time: $(mins $((now - t0)))."
+      else
+        status=FAIL
+        msg="$data; NocoBase not healthy after $(mins $HEALTH_TIMEOUT_SECONDS) (last $HEALTH_URL -> $code; logs: container nocobase)."
+      fi
+    fi
+    echo "$status: $msg"
+
+    if [ -n "$NTFY_HOST" ] && [ -n "$NTFY_TOKEN" ]; then
+      if [ "$status" = PASS ]; then prio=3; tag=white_check_mark; else prio=4; tag=x; fi
+      # Tag "chatops" so the ChatOps listener does not read it as a command.
+      curl -sS -o /dev/null --max-time 20 \
+        --connect-to "$NTFY_HOST:443:$NTFY_VIA:443" \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: DR drill $status (NocoBase rebuilt from restic/home)" \
+        -H "Priority: $prio" -H "Tags: chatops,$tag" \
+        -d "$msg" "https://$NTFY_HOST/$NTFY_TOPIC" || echo "ntfy post failed"
+    fi
+    if [ -n "$HEALTHCHECK_URL" ]; then
+      url=$HEALTHCHECK_URL
+      [ "$status" = PASS ] || url="$HEALTHCHECK_URL/fail"
+      curl -sS -o /dev/null --max-time 20 --retry 3 -d "$msg" "$url" || echo "healthchecks ping failed"
+    fi
+    rm -rf $W/* 2>/dev/null
+    [ "$status" = PASS ]

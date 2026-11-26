@@ -1,0 +1,250 @@
+# Monthly disaster-recovery drill: rebuild NocoBase from the Home backup
+# the way a real recovery would, and time it. 1st of the month, 03:00
+# local time. Reuses the restore test's secret (restore-test) and scripts.
+# Steps and scripts: dr-drill-scripts.yaml.
+#
+# Run it now:
+#   kubectl -n restore-test create job --from=cronjob/dr-drill dr-drill-manual
+#   kubectl -n restore-test logs -f job/dr-drill-manual -c report
+#
+# Production versions on purpose: postgres:16-alpine (NocoBase's database on
+# Home is 16; the tag floats within 16) and nocobase/nocobase:latest.
+# NocoBase runs as root (its image starts nginx and writes into /app), so
+# this pod is the one place where a container is not forced to non-root.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dr-drill
+  namespace: restore-test
+spec:
+  suspend: false
+  schedule: "0 3 1 * *"
+  timeZone: UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 5400
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          securityContext:
+            fsGroup: 999 # /work is group-writable for every step
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: restore
+              image: docker.io/restic/restic:latest
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/scripts/restore.sh"]
+              env:
+                - name: RESTIC_HOST
+                  value: home
+                - name: DUMP_PATH
+                  value: nocobase/nocobase.sql.gz
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+                - name: HOME
+                  value: /work
+              envFrom:
+                - secretRef:
+                    name: restore-test
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 999
+                runAsGroup: 999
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: restore-scripts, mountPath: /scripts, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+            # Native sidecars (restartPolicy: Always) stop by themselves when
+            # "load" and "report" have exited.
+            - name: postgres
+              image: docker.io/library/postgres:16-alpine
+              imagePullPolicy: Always
+              restartPolicy: Always
+              args:
+                - -c
+                - listen_addresses=127.0.0.1
+                - -c
+                - fsync=off
+                - -c
+                - full_page_writes=off
+                - -c
+                - synchronous_commit=off
+                - -c
+                - shared_buffers=64MB
+              env:
+                - name: POSTGRES_HOST_AUTH_METHOD
+                  value: trust
+                - name: PGDATA
+                  value: /var/lib/postgresql/data/pgdata
+              startupProbe:
+                exec:
+                  command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+                periodSeconds: 2
+                failureThreshold: 90
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 70 # postgres in the Alpine image
+                runAsGroup: 70
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: pgdata, mountPath: /var/lib/postgresql/data }
+                - { name: pgrun, mountPath: /var/run/postgresql }
+                - { name: tmp, mountPath: /tmp }
+            - name: nocobase
+              image: docker.io/nocobase/nocobase:latest
+              imagePullPolicy: Always
+              restartPolicy: Always
+              command: ["/bin/sh", "/dr/nocobase.sh"]
+              env:
+                - name: TZ
+                  value: UTC
+                - name: DB_DIALECT
+                  value: postgres
+                - name: DB_HOST
+                  value: 127.0.0.1
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_DATABASE
+                  value: nocobase
+                - name: DB_USER
+                  value: nocobase
+                - name: INIT_APP_LANG
+                  value: en-US
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+                limits:
+                  cpu: "1"
+                  memory: 1536Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: dr-scripts, mountPath: /dr, readOnly: true }
+                - { name: nocobase-storage, mountPath: /app/nocobase/storage }
+          containers:
+            - name: load
+              image: docker.io/library/postgres:16-alpine
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/dr/load.sh"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 70
+                runAsGroup: 70
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: dr-scripts, mountPath: /dr, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+            - name: report
+              image: docker.io/curlimages/curl:latest
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/dr/report.sh"]
+              env:
+                # NocoBase's own health route (gateway, answers 200 once the
+                # app is running); 13000 is the app port behind the image's nginx.
+                - name: HEALTH_URL
+                  value: http://127.0.0.1:13000/api/__health_check
+                - name: HEALTH_TIMEOUT_SECONDS
+                  value: "600"
+                - name: NTFY_HOST
+                  value: ${HOME_TAILNET_FQDN}
+                - name: NTFY_TOPIC
+                  value: ${NTFY_TOPIC}
+                - name: NTFY_VIA
+                  value: ntfy-home.tailscale.svc.cluster.local
+                - name: NTFY_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: restore-test
+                      key: NTFY_TOKEN
+                - name: HEALTHCHECK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: restore-test
+                      key: DR_HEALTHCHECK_URL
+                      optional: true
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 999
+                runAsGroup: 999
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: dr-scripts, mountPath: /dr, readOnly: true }
+          volumes:
+            - name: work
+              emptyDir:
+                sizeLimit: 4Gi
+            - name: pgdata
+              emptyDir:
+                sizeLimit: 6Gi
+            - name: pgrun
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Mi
+            - name: tmp
+              emptyDir:
+                sizeLimit: 512Mi
+            - name: nocobase-storage
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: restore-scripts
+              configMap:
+                name: restore-test-scripts
+                defaultMode: 0555
+            - name: dr-scripts
+              configMap:
+                name: dr-drill-scripts
+                defaultMode: 0555

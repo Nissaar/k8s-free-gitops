@@ -1,0 +1,16 @@
+# Plaintext secrets: NEVER committed. Secrets live in OCI Vault; only
+# *.sops.yaml (encrypted: the Vault reader key) and *.example.yaml (dummy
+# values) belong in git.
+*.secret.yaml
+*.plain.yaml
+*.dec.yaml
+.env
+.env.*
+# age private keys
+keys.txt
+*.agekey
+# local tool output
+/.cache/
+/rendered/
+# your input for scripts/configure.sh (not secret, but personal: the files it writes are what you commit)
+cluster.env

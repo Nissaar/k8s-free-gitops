@@ -1,0 +1,45 @@
+# Pods may only use images from these registries. Floating tags such as
+# :latest are allowed on purpose (the owner's rule), so there is no tag policy.
+# image(...).registry() comes from Kyverno's CEL image library; images with no
+# registry (traefik/whoami) resolve to Docker Hub.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: allowed-registries
+  annotations:
+    policies.kyverno.io/title: Allowed image registries
+    policies.kyverno.io/description: >-
+      Images must come from Docker Hub, GHCR, quay.io (Prometheus),
+      mirror.gcr.io (Trivy), reg.kyverno.io or registry.k8s.io.
+spec:
+  validationActions: [Audit] # set for all policies in kustomization.yaml
+  failurePolicy: Ignore
+  autogen:
+    podControllers:
+      controllers: [deployments, statefulsets, daemonsets, jobs, cronjobs]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kube-node-lease, kube-public]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers
+        + object.spec.?initContainers.orValue([])
+        + object.spec.?ephemeralContainers.orValue([])
+    - name: allowed
+      expression: >-
+        ['docker.io', 'index.docker.io', 'ghcr.io', 'quay.io', 'mirror.gcr.io',
+         'reg.kyverno.io', 'registry.k8s.io']
+  validations:
+    - expression: >-
+        variables.containers.all(c, image(c.image).registry() in variables.allowed)
+      messageExpression: >-
+        'every image must come from one of: ' + variables.allowed.join(', ')

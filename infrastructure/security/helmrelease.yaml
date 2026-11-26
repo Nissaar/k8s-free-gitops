@@ -1,0 +1,226 @@
+# CrowdSec on the cluster: a DETECTOR that reads Traefik's access log and
+# tells you on ntfy (topic `security`) who is attacking. It blocks NOTHING.
+#
+# Pieces (official chart, LAPI + agent):
+#   crowdsec-lapi    Deployment, 1 replica: the local API, sqlite on a
+#                    local-path PVC (alerts, agent registrations), runs the
+#                    notification plugin http_ntfy.
+#   crowdsec-agent   DaemonSet, one per node: reads the Traefik pod logs under
+#                    /var/log/containers (hostPath, read-only), parses them,
+#                    sends alerts to the LAPI.
+# Traefik writes its access log to stdout (infrastructure/controllers/traefik,
+# accessLog.enabled); the pods' CRI log files are what the agent tails.
+#
+# ALERT ONLY, no bouncer: Cloudflare fronts all traffic, so a bouncer in the
+# cluster would act on Cloudflare addresses or on a spoofable
+# X-Forwarded-For. Blocking stays with ChatOps `block` (Cloudflare). To
+# enforce later, see docs/WHAT-YOU-DO.md (CrowdSec, "enforce later").
+#
+# Sizing: the two nodes are about 80% reserved on CPU (the troubleshooting table in the README,
+# KubeCPUOvercommit), so requests are tiny (10m each, 30m in total) and the
+# limits leave headroom for the hub download at start. The online API
+# (community blocklist, signal sharing) is OFF: nothing would use the list
+# without a bouncer, and it costs memory and CPU on the LAPI.
+#
+# Secrets: the ntfy token comes from Secret crowdsec/ntfy (ExternalSecret,
+# Vault "crowdsec-ntfy"). The init container render-ntfy fills the token into
+# the notification file inside an emptyDir; the token is in no ConfigMap.
+#
+# Root: the agent reads root-owned files under /var/log/pods (same as
+# otel-logs), and the CrowdSec image's entrypoint writes into /etc/crowdsec,
+# so neither non-root nor a read-only root filesystem works with this image.
+# Privilege escalation is off, nothing is privileged, seccomp RuntimeDefault.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: crowdsec
+  namespace: crowdsec
+spec:
+  interval: 1h
+  releaseName: crowdsec
+  timeout: 10m
+  chart:
+    spec:
+      chart: crowdsec
+      version: "0.x"
+      sourceRef:
+        kind: HelmRepository
+        name: crowdsec
+        namespace: flux-system
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    # OKE nodes use CRI log files (containerd/CRI-O format), not Docker's.
+    container_runtime: containerd
+    image:
+      repository: docker.io/crowdsecurity/crowdsec
+      # Empty tag = the chart's appVersion; the chart range below follows it.
+      tag: ""
+    # Which pods' logs the agent reads: /var/log/containers/<pod>_<ns>_*.log
+    agent:
+      acquisition:
+        - namespace: traefik
+          podName: "traefik-*"
+          program: traefik
+      env:
+        - name: COLLECTIONS
+          value: "crowdsecurity/traefik crowdsecurity/http-cve crowdsecurity/base-http-scenarios"
+        - name: PARSERS
+          value: "crowdsecurity/cri-logs"
+      resources:
+        requests:
+          cpu: 10m
+          memory: 128Mi
+        limits:
+          cpu: 300m
+          memory: 320Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        privileged: false
+        seccompProfile:
+          type: RuntimeDefault
+      nodeSelector:
+        kubernetes.io/arch: arm64
+    lapi:
+      replicas: 1
+      env:
+        # No community blocklist / signal sharing (alert only, no bouncer).
+        - name: DISABLE_ONLINE_API
+          value: "true"
+      resources:
+        requests:
+          cpu: 10m
+          memory: 96Mi
+        limits:
+          cpu: 300m
+          memory: 256Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        privileged: false
+        seccompProfile:
+          type: RuntimeDefault
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      persistentVolume:
+        data:
+          size: 1Gi
+        config:
+          size: 100Mi
+      # Fill the ntfy token into the notification file (see the header).
+      extraInitContainers:
+        - name: render-ntfy
+          image: docker.io/library/busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              [ -n "$NTFY_TOKEN" ] || { echo "NTFY_TOKEN is empty"; exit 1; }
+              sed -e "s|@NTFY_URL@|$NTFY_URL|" -e "s|@NTFY_TOKEN@|$NTFY_TOKEN|" \
+                /template/http.yaml.tpl > /rendered/http.yaml
+              chmod 0644 /rendered/http.yaml
+          env:
+            - name: NTFY_URL
+              value: https://ntfy.${BASE_DOMAIN}/
+            - name: NTFY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ntfy
+                  key: NTFY_TOKEN
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: ntfy-template
+              mountPath: /template
+              readOnly: true
+            - name: ntfy-rendered
+              mountPath: /rendered
+      extraVolumes:
+        - name: ntfy-template
+          configMap:
+            name: crowdsec-ntfy-template
+        - name: ntfy-rendered
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+      extraVolumeMounts:
+        - name: ntfy-rendered
+          mountPath: /etc/crowdsec_data/notifications/http.yaml
+          subPath: http.yaml
+          readOnly: true
+    config:
+      # Every single-address alert -> a ntfy message and a 4 h "ban" decision
+      # that only feeds `cscli decisions list` (no bouncer reads it).
+      profiles.yaml: |
+        name: default_ip_remediation
+        filters:
+          - Alert.Remediation == true && Alert.GetScope() == "Ip"
+        decisions:
+          - type: ban
+            duration: 4h
+        notifications:
+          - http_ntfy
+        on_success: break
+      parsers:
+        s02-enrich:
+          # Never alert on private ranges (a log line showing a pod or node
+          # address means Traefik does not see the real visitor: fix that
+          # first, see docs/WHAT-YOU-DO.md) or on your own addresses.
+          my-whitelist.yaml: |
+            name: local/own-whitelist
+            description: "loopback, private ranges, tailnet, own addresses"
+            whitelist:
+              reason: "private / tailnet / own address"
+              cidr:
+                - 127.0.0.0/8
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 100.64.0.0/10
+                # Your own addresses, one per line, e.g.:
+                # - <your-home-address>/32
+  postRenderers:
+    - kustomize:
+        patches:
+          # The chart's wait-for-lapi-and-register init container (runs
+          # `cscli lapi register`) has a 50 Mi memory limit and no CPU limit;
+          # the Kyverno policy require-requests-limits wants both, and cscli
+          # needs a little more than 50 Mi.
+          - target:
+              kind: DaemonSet
+              name: crowdsec-agent
+            patch: |
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: crowdsec-agent
+              spec:
+                template:
+                  spec:
+                    initContainers:
+                      - name: wait-for-lapi-and-register
+                        resources:
+                          limits:
+                            cpu: 200m
+                            memory: 128Mi
+                          requests:
+                            cpu: 1m
+                            memory: 10Mi

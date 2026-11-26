@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - proxyclass.yaml
+  # Optional (needs a private ntfy on a home server and a ChatOps client, see docs/RECIPES.md):
+  # - egress-ntfy-home.yaml
+  # - rbac-chatops.yaml

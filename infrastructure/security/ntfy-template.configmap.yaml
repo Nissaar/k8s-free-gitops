@@ -1,0 +1,80 @@
+# CrowdSec -> ntfy notification file (plugin http_ntfy), template. The init
+# container render-ntfy of crowdsec-lapi fills @NTFY_URL@ and @NTFY_TOKEN@ and
+# writes the result to /etc/crowdsec/notifications/http.yaml. Same message
+# format as <home-server-repo> crowdsec/setup.sh (urgency, hosts/paths, HTTP
+# status per attacking address), title says "cluster" so the two sources can be
+# told apart on topic security; no `ban` line (nodes have no host firewall
+# managed here).
+# Flux substitution is off: the Go template uses $variables and braces.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crowdsec-ntfy-template
+  namespace: crowdsec
+  annotations:
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+data:
+  http.yaml.tpl: |
+    type: http
+    name: http_ntfy
+    log_level: info
+    url: "@NTFY_URL@"
+    method: POST
+    group_wait: 10s
+    group_threshold: 50   # without this CrowdSec sends chunks of 1 alert = no grouping
+    headers:
+      Authorization: "Bearer @NTFY_TOKEN@"
+      Content-Type: application/json
+    format: |
+      {{- define "esc" -}}{{- $q := toJson . -}}{{- substr 1 (int (sub (int64 (len $q)) 1)) $q -}}{{- end -}}
+      {{- $all := . -}}
+      {{- $first := index . 0 -}}
+      {{- $rank := dict -}}
+      {{- $tot := dict -}}
+      {{- $top := 0 -}}
+      {{- range $a := . -}}
+        {{- $k := toJson $a.Source.Value -}}
+        {{- $sc := toJson $a.Scenario -}}
+        {{- $lvl := 0 -}}
+        {{- if regexMatch "sensitive|admin|traversal|cve|bf|brute|stuff" $sc -}}
+          {{- $lvl = 1 -}}
+          {{- range $e := $a.Events -}}{{- range $m := $e.Meta -}}{{- if and (eq $m.Key "http_status") (hasPrefix "2" $m.Value) -}}{{- $lvl = 2 -}}{{- end -}}{{- end -}}{{- end -}}
+        {{- end -}}
+        {{- $_ := set $tot $k (add (int (default 0 (get $tot $k))) (int (toJson $a.EventsCount))) -}}
+        {{- $cur := int (default 0 (get $rank $k)) -}}
+        {{- if gt $lvl $cur -}}{{- $_ := set $rank $k $lvl -}}{{- end -}}
+        {{- if gt $lvl $top -}}{{- $top = $lvl -}}{{- end -}}
+      {{- end -}}
+      {"topic":"security","priority":{{ if eq $top 2 }}4{{ else }}3{{ end }},"tags":["rotating_light"],
+       "title":"CrowdSec cluster {{ if eq $top 2 }}HIGH{{ else if eq $top 1 }}MEDIUM{{ else }}LOW{{ end }}: {{ if eq (len .) 1 }}{{ $first.Scenario }}{{ else }}{{ len . }} rules tripped{{ end }}",
+       "message":"
+      {{- range $i, $a := . -}}
+        {{- $k := toJson $a.Source.Value -}}
+        {{- $seen := false -}}
+        {{- range $j, $b := $all -}}{{- if and (lt $j $i) (eq (toJson $b.Source.Value) $k) -}}{{- $seen = true -}}{{- end -}}{{- end -}}
+        {{- if not $seen -}}
+          {{- $r := int (default 0 (get $rank $k)) -}}
+          {{- if eq $r 2 -}}HIGH{{- else if eq $r 1 -}}MEDIUM{{- else -}}LOW{{- end }} ({{ get $tot $k }} events): {{ $a.Source.Value }} ({{ template "esc" $a.Source.Cn }}, {{ template "esc" $a.Source.AsName }})\n
+          {{- range $b := $all -}}
+            {{- if eq (toJson $b.Source.Value) $k -}}
+              {{- $ps := list -}}
+              {{- range $e := $b.Events -}}
+                {{- $h := "" -}}{{- $p := "" -}}{{- $st := "" -}}
+                {{- range $m := $e.Meta -}}
+                  {{- if eq $m.Key "http_path" -}}{{- $p = $m.Value -}}
+                  {{- else if eq $m.Key "http_status" -}}{{- $st = $m.Value -}}
+                  {{- else if eq $m.Key "target_fqdn" -}}{{- $h = $m.Value -}}
+                  {{- else if eq $m.Key "target_user" -}}{{- $p = printf "user %s" $m.Value -}}
+                  {{- end -}}
+                {{- end -}}
+                {{- if $p -}}{{- $line := trunc 80 (printf "%s%s [%s]" $h $p $st) -}}{{- if hasPrefix "2" $st -}}{{- $ps = concat (list $line) $ps -}}{{- else -}}{{- $ps = append $ps $line -}}{{- end -}}{{- end -}}
+              {{- end -}}
+              {{- $u := uniq $ps -}}
+              {{- $n := min 3 (len $u) -}}
+              - {{ $b.Scenario }} ({{ $b.EventsCount }} ev){{ if $u }}: {{ template "esc" (join ", " (slice $u 0 $n)) }}{{ if gt (len $u) 3 }} +{{ sub (int64 (len $u)) 3 }} more{{ end }}{{ end }}\n
+            {{- end -}}
+          {{- end -}}
+          whois {{ $a.Source.Value }}\nblock {{ $a.Source.Value }} <reason>   (web attackers, through Cloudflare: ChatOps cloudflare channel)\n\n
+        {{- end -}}
+      {{- end -}}
+      Cluster oke-free: alert only, nothing is blocked here. Reply in the ChatOps cloudflare channel to block at Cloudflare."}

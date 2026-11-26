@@ -1,0 +1,54 @@
+# trivy config findings accepted on purpose. Each entry says why.
+# Used by CI (trivy-action input trivyignores) and locally:
+#   trivy config --ignorefile .trivyignore.yaml --skip-dirs .cache .
+misconfigurations:
+  - id: KSV-0013
+    statement: >-
+      Floating image tags (:latest) are the owner's rule. apps/hello follows
+      :latest by digest through Flux image automation instead of a version tag.
+  - id: KSV-0125
+    statement: >-
+      Trivy's built-in trusted-registry list does not match ours; the allowed
+      registries are enforced in-cluster by the Kyverno policy
+      infrastructure/configs/kyverno-policies/allowed-registries.yaml.
+  - id: KSV-0109
+    paths:
+      - infrastructure/configs/previews/smoke-test-script.yaml
+    statement: >-
+      False positive: the scripts name a header (CF-Access-Client-Secret) and
+      read the service-account token file; the values come from Secrets.
+  - id: KSV-0108
+    paths:
+      - infrastructure/configs/tailscale/egress-ntfy-home.yaml
+    statement: >-
+      Tailscale egress proxies are ExternalName Services by design; the
+      operator points externalName at its own proxy.
+  - id: KSV-0048
+    paths:
+      - infrastructure/configs/tailscale/rbac-chatops.yaml
+    statement: >-
+      ChatOps restarts deployments (krestart = patch of the pod template);
+      it gets no other write access to workloads.
+  - id: KSV-0109
+    paths:
+      - infrastructure/configs/restore-test/dr-drill-scripts.yaml
+    statement: >-
+      False positive: the script generates a random throwaway database
+      password at run time; no secret is stored in the ConfigMap.
+  - id: KSV-01010
+    paths:
+      - infrastructure/configs/restore-test/dr-drill-scripts.yaml
+    statement: >-
+      False positive: APP_KEY is generated randomly at run time by the script.
+  - id: KSV-0012
+    paths:
+      - infrastructure/configs/restore-test/dr-drill.yaml
+    statement: >-
+      The nocobase/nocobase image starts nginx and writes into /app as root;
+      the drill runs the production image unchanged, in a throwaway pod.
+  - id: KSV-0014
+    paths:
+      - infrastructure/configs/restore-test/dr-drill.yaml
+    statement: >-
+      The NocoBase entrypoint runs yarn postinstall and writes nginx config
+      under /app; it cannot run on a read-only root filesystem.

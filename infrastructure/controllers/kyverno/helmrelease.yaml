@@ -1,0 +1,73 @@
+# Kyverno, trimmed for 2 small nodes: one admission replica, cleanup
+# controller off (no cleanup policies here). Policies live in
+# infrastructure/configs/kyverno-policies and start in Audit.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kyverno
+  namespace: kyverno
+spec:
+  interval: 1h
+  releaseName: kyverno
+  chart:
+    spec:
+      chart: kyverno
+      version: "3.x"
+      sourceRef:
+        kind: HelmRepository
+        name: kyverno
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    admissionController:
+      replicas: 1
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      container:
+        resources:
+          requests:
+            cpu: 15m
+            memory: 128Mi
+          limits:
+            cpu: "1"
+            memory: 384Mi
+      initContainer:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+    backgroundController:
+      replicas: 1
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    reportsController:
+      replicas: 1
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+    cleanupController:
+      enabled: false

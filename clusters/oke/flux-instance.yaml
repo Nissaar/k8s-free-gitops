@@ -1,0 +1,65 @@
+# The FluxInstance for the oke-free cluster.
+#
+# Applied once by oracle-always-free's flux-bootstrap.yml (kubectl apply -f this
+# file). After that it is also part of clusters/oke, so Flux keeps it in sync
+# from git: edit it here, never with kubectl.
+apiVersion: fluxcd.controlplane.io/v1
+kind: FluxInstance
+metadata:
+  name: flux
+  namespace: flux-system
+  annotations:
+    fluxcd.controlplane.io/reconcileEvery: "1h"
+    fluxcd.controlplane.io/reconcileArtifactEvery: "10m"
+    fluxcd.controlplane.io/reconcileTimeout: "5m"
+spec:
+  distribution:
+    # Floating: the operator follows the newest Flux 2.x release.
+    version: "2.x"
+    registry: ghcr.io/fluxcd
+    artifact: oci://ghcr.io/controlplaneio-fluxcd/flux-operator-manifests
+  components:
+    - source-controller
+    - kustomize-controller
+    - helm-controller
+    - notification-controller
+    - image-reflector-controller
+    - image-automation-controller
+  cluster:
+    type: kubernetes
+    # OKE uses the default cluster domain.
+    domain: cluster.local
+    # "small" = low concurrency and small limits: right for 2 x 6 GB nodes.
+    size: small
+    multitenant: false
+    # flannel on OKE does not enforce NetworkPolicy; harmless either way.
+    networkPolicy: true
+  sync:
+    kind: GitRepository
+    url: ssh://git@github.com/<your-github-user>/k8s-free-gitops.git
+    ref: refs/heads/main
+    path: clusters/oke
+    # Created by flux-bootstrap.yml: keys identity, identity.pub, known_hosts.
+    # Read/write deploy key, because image automation pushes to main.
+    pullSecret: flux-git-auth
+    interval: 10m
+  kustomize:
+    patches:
+      # The nodes are 2 x 1 OCPU (840m allocatable each) and requests were at 99% with Flux alone
+      # holding 600m (6 controllers x 100m), so Prometheus and others stayed Pending. The
+      # controllers are idle most of the time: reserve 20m each, keep the limits.
+      - target:
+          kind: Deployment
+        patch: |
+          - op: add
+            path: /spec/template/spec/containers/0/resources/requests/cpu
+            value: 20m
+      # All nodes are arm64; make that explicit so nothing lands elsewhere.
+      - target:
+          kind: Deployment
+        patch: |
+          - op: add
+            path: /spec/template/spec/nodeSelector
+            value:
+              kubernetes.io/os: linux
+              kubernetes.io/arch: arm64

@@ -1,0 +1,21 @@
+# Template only (dummy values). The API key of the OCI user
+# cluster-secrets-reader (oracle-always-free bootstrap): read-only on the secrets of
+# the one vault. It is the only secret still sealed with SOPS in this repo;
+# every other secret is in OCI Vault and comes in through ExternalSecrets.
+#
+# Do not fill this by hand: oracle-always-free's scripts/make-reader-key.sh makes
+# the key pair on your laptop, uploads the public half to Oracle and seals
+# privateKey + fingerprint into oci-vault-reader.sops.yaml next to this file
+# (docs/WHAT-YOU-DO.md step 19).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oci-vault-reader
+  namespace: external-secrets
+type: Opaque
+stringData:
+  privateKey: |
+    -----BEGIN PRIVATE KEY-----
+    dummy-replace-me
+    -----END PRIVATE KEY-----
+  fingerprint: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"

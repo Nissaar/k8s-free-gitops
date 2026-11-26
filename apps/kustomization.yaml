@@ -1,0 +1,5 @@
+# One line per app. To move an app in: add a folder apps/<app>/ and a line here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - hello

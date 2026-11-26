@@ -1,0 +1,149 @@
+# Platform layers, applied in order:
+#   infra-external-secrets -> infra-controllers -> infra-configs -> apps
+#                                                               -> infra-monitoring (Prometheus, Alertmanager, OTel)
+#                                                               -> infra-security (CrowdSec, alert only)
+# Secrets come from OCI Vault through ExternalSecrets (ClusterSecretStore
+# oci-vault). The only SOPS secret left is the Vault reader's key in
+# infra-external-secrets; every layer keeps SOPS decryption (sops-age, made by
+# oracle-always-free's flux-bootstrap.yml) so a sealed file still works anywhere.
+#
+# External Secrets Operator first, alone: its CRDs (ExternalSecret,
+# ClusterSecretStore) must exist before any layer that uses them.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-external-secrets
+  namespace: flux-system
+spec:
+  interval: 1h
+  retryInterval: 2m
+  timeout: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/controllers/external-secrets
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-controllers
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infra-external-secrets
+  interval: 1h
+  retryInterval: 2m
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/controllers
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-configs
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infra-controllers
+  interval: 1h
+  retryInterval: 2m
+  timeout: 10m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/configs
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings
+---
+# kube-prometheus-stack (slim) + OpenTelemetry Collector. Apart, like the
+# other layers: a broken monitoring stack (wrong Grafana Cloud token) never
+# blocks apps, and nothing depends on it.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-monitoring
+  namespace: flux-system
+spec:
+  # Off until you created the monitoring secrets (docs/RECIPES.md, recipe 7): set to false.
+  suspend: true
+  dependsOn:
+    - name: infra-configs
+  interval: 1h
+  retryInterval: 5m
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/monitoring
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings
+---
+# CrowdSec (detector on Traefik's access log, alerts to ntfy `security`). Apart,
+# like monitoring: a broken CrowdSec never blocks apps, and nothing depends on
+# it. After infra-configs, so Traefik (with its access log) and the Kyverno
+# policies are in place and the ExternalSecret CRDs exist.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infra-security
+  namespace: flux-system
+spec:
+  # Off until you created the the CrowdSec ntfy secret (see the README, optional layers): set to false.
+  suspend: true
+  dependsOn:
+    - name: infra-configs
+  interval: 1h
+  retryInterval: 5m
+  timeout: 15m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  path: ./infrastructure/security
+  prune: true
+  wait: true
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-settings

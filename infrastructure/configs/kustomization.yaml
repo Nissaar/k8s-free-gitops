@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - kyverno-policies
+  - tailscale
+  - image-automation
+  # Optional layers, off by default (see docs/RECIPES.md, recipes 5 and 8):
+  # - previews
+  # - restore-test

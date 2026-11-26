@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - scripts.yaml
+  - cronjob.yaml
+  - dr-drill-scripts.yaml
+  - dr-drill.yaml
+  - restore-test.externalsecret.yaml

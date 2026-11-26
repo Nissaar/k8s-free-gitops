@@ -1,0 +1,102 @@
+# cloudflared for the remotely managed tunnel "oke-free" (cloudflare-free).
+# Its hostnames and the origin (Traefik) live in Cloudflare; the pods only need
+# the token, which comes from the Secret cloudflared/tunnel-token (External
+# Secrets, OCI Vault "cloudflared-tunnel-token").
+#
+# The chart is minimal (no resources, no securityContext, and it wants the
+# token in values), so post-renderers patch the Deployment and drop the
+# chart's own Secret: the token never passes through Helm values.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cloudflared
+  namespace: cloudflared
+spec:
+  interval: 1h
+  releaseName: cloudflared
+  chart:
+    spec:
+      chart: cloudflare-tunnel-remote
+      version: "0.x"
+      sourceRef:
+        kind: HelmRepository
+        name: cloudflare
+        namespace: flux-system
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    fullnameOverride: cloudflared
+    replicaCount: 2
+    image:
+      repository: docker.io/cloudflare/cloudflared
+      tag: latest
+      pullPolicy: Always
+    cloudflare:
+      # Not used: the post-renderer below points the pods at tunnel-token.
+      tunnel_token: unused
+  postRenderers:
+    - kustomize:
+        patches:
+          - target:
+              kind: Secret
+              name: cloudflared
+            patch: |
+              $patch: delete
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: cloudflared
+          - target:
+              kind: Deployment
+              name: cloudflared
+            patch: |
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: cloudflared
+              spec:
+                template:
+                  spec:
+                    automountServiceAccountToken: false
+                    securityContext:
+                      runAsNonRoot: true
+                      runAsUser: 65532
+                      runAsGroup: 65532
+                      seccompProfile:
+                        type: RuntimeDefault
+                    nodeSelector:
+                      kubernetes.io/arch: arm64
+                    topologySpreadConstraints:
+                      - maxSkew: 1
+                        topologyKey: kubernetes.io/hostname
+                        whenUnsatisfiable: ScheduleAnyway
+                        labelSelector:
+                          matchLabels:
+                            pod: cloudflared
+                    containers:
+                      - name: cloudflared
+                        env:
+                          - name: TUNNEL_TOKEN
+                            valueFrom:
+                              secretKeyRef:
+                                name: tunnel-token
+                                key: TUNNEL_TOKEN
+                        securityContext:
+                          allowPrivilegeEscalation: false
+                          readOnlyRootFilesystem: true
+                          capabilities:
+                            drop: ["ALL"]
+                        livenessProbe:
+                          failureThreshold: 3
+                        resources:
+                          requests:
+                            cpu: 20m
+                            memory: 32Mi
+                          limits:
+                            cpu: 300m
+                            memory: 128Mi

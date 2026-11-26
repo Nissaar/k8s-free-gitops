@@ -1,0 +1,239 @@
+# PR previews, generic for every app that opts in.
+#
+# Inputs: every ResourceSetInputProvider in namespace "previews" labelled
+#   previews.example.com/enabled: "true"
+# (one per app repo, kept in apps/<app>/preview.yaml; see
+# docs/examples/preview-provider.yaml). The GitHubPullRequest provider exports
+# per open PR with the label "preview": id (PR number), sha, branch, author,
+# title; the provider's defaultValues add app, image, port, healthPath,
+# expectStatus.
+#
+# Per PR it makes namespace pr-<n> and, per app, a Deployment of
+# <image>:pr-<n> (the app's CI pushes that tag), a Service and an Ingress at
+#   https://pr-<n>-<app>.example.com
+# (first-level name: Universal SSL does not cover pr-<n>.<app>.example.com).
+# When the app is Ready, step "smoke" runs a Job that opens the URL with the
+# Cloudflare Access service token and reports to ntfy. A new commit gives a
+# new Job name (short SHA), so every push is tested once. Closing or
+# unlabelling the PR deletes everything (garbage collection).
+#
+# Template syntax is << >> (Flux Operator); ${...} values are Flux postBuild
+# variables from clusters/oke/cluster-settings.yaml, filled in before the
+# operator sees this object.
+apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSet
+metadata:
+  name: previews
+  namespace: previews
+spec:
+  inputsFrom:
+    - apiVersion: fluxcd.controlplane.io/v1
+      kind: ResourceSetInputProvider
+      selector:
+        matchLabels:
+          previews.example.com/enabled: "true"
+  steps:
+    - name: app
+      timeout: 10m
+      resources:
+        - apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: pr-<< inputs.id >>
+            labels:
+              previews.example.com/pr: << inputs.id | quote >>
+        # Defaults so preview pods satisfy the requests/limits policy, and a
+        # cap so a preview cannot eat the nodes.
+        - apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: defaults
+            namespace: pr-<< inputs.id >>
+          spec:
+            limits:
+              - type: Container
+                defaultRequest:
+                  cpu: 20m
+                  memory: 32Mi
+                default:
+                  cpu: 500m
+                  memory: 256Mi
+        - apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: preview
+            namespace: pr-<< inputs.id >>
+          spec:
+            hard:
+              pods: "10"
+              requests.cpu: "1"
+              requests.memory: 512Mi
+              limits.cpu: "2"
+              limits.memory: 1Gi
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: preview-smoke
+            namespace: pr-<< inputs.id >>
+            annotations:
+              fluxcd.controlplane.io/copyFrom: previews/preview-smoke
+          type: Opaque
+        - apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: smoke-test
+            namespace: pr-<< inputs.id >>
+            annotations:
+              fluxcd.controlplane.io/copyFrom: previews/smoke-test
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: << inputs.app >>
+            namespace: pr-<< inputs.id >>
+            labels:
+              app.kubernetes.io/name: << inputs.app >>
+            annotations:
+              previews.example.com/branch: << inputs.branch | quote >>
+              previews.example.com/author: << inputs.author | quote >>
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: << inputs.app >>
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: << inputs.app >>
+                annotations:
+                  # Changes on every push, so the pod restarts and pulls the
+                  # new pr-<n> image.
+                  previews.example.com/sha: << inputs.sha | quote >>
+              spec:
+                automountServiceAccountToken: false
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                securityContext:
+                  runAsNonRoot: true
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: app
+                    image: << inputs.image >>:pr-<< inputs.id >>
+                    imagePullPolicy: Always
+                    ports:
+                      - name: http
+                        containerPort: << inputs.port | int >>
+                    readinessProbe:
+                      httpGet:
+                        path: << inputs.healthPath >>
+                        port: http
+                      periodSeconds: 10
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: ["ALL"]
+        - apiVersion: v1
+          kind: Service
+          metadata:
+            name: << inputs.app >>
+            namespace: pr-<< inputs.id >>
+          spec:
+            selector:
+              app.kubernetes.io/name: << inputs.app >>
+            ports:
+              - name: http
+                port: 80
+                targetPort: http
+        - apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: << inputs.app >>
+            namespace: pr-<< inputs.id >>
+            annotations:
+              traefik.ingress.kubernetes.io/router.entrypoints: web
+          spec:
+            ingressClassName: traefik
+            rules:
+              - host: pr-<< inputs.id >>-<< inputs.app >>.${BASE_DOMAIN}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: << inputs.app >>
+                          port:
+                            name: http
+    - name: smoke
+      timeout: 15m
+      resources:
+        - apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: smoke-<< inputs.app >>-<< inputs.sha | trunc 7 >>
+            namespace: pr-<< inputs.id >>
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 600
+            template:
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                nodeSelector:
+                  kubernetes.io/arch: arm64
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  runAsGroup: 101
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: smoke
+                    image: docker.io/curlimages/curl:latest
+                    imagePullPolicy: Always
+                    command: ["/bin/sh", "/scripts/smoke-test.sh"]
+                    env:
+                      - name: URL
+                        value: https://pr-<< inputs.id >>-<< inputs.app >>.${BASE_DOMAIN}
+                      - name: HEALTH_PATH
+                        value: << inputs.healthPath | quote >>
+                      - name: EXPECT_STATUS
+                        value: << get inputs "expectStatus" | default "200" | quote >>
+                      - name: TIMEOUT_SECONDS
+                        value: "300"
+                      - name: APP
+                        value: << inputs.app | quote >>
+                      - name: PR
+                        value: << inputs.id | quote >>
+                      - name: SHA
+                        value: << inputs.sha | quote >>
+                      - name: NTFY_HOST
+                        value: ${HOME_TAILNET_FQDN}
+                      - name: NTFY_TOPIC
+                        value: ${NTFY_TOPIC}
+                      - name: NTFY_VIA
+                        value: ntfy-home.tailscale.svc.cluster.local
+                    envFrom:
+                      - secretRef:
+                          name: preview-smoke
+                    resources:
+                      requests:
+                        cpu: 10m
+                        memory: 16Mi
+                      limits:
+                        cpu: 200m
+                        memory: 64Mi
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: ["ALL"]
+                    volumeMounts:
+                      - name: scripts
+                        mountPath: /scripts
+                        readOnly: true
+                volumes:
+                  - name: scripts
+                    configMap:
+                      name: smoke-test

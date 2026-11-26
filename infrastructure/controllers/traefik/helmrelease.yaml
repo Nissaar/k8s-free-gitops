@@ -1,0 +1,89 @@
+# Traefik: the only HTTP entry for public names. No LoadBalancer: cloudflared
+# (namespace cloudflared) is the only client and calls
+#   http://traefik.traefik.svc.cluster.local:80   (cloudflare-free cluster_origin)
+# TLS ends at Cloudflare; inside the cluster it is plain HTTP on entrypoint web.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: traefik
+  namespace: traefik
+spec:
+  interval: 1h
+  releaseName: traefik
+  chart:
+    spec:
+      chart: traefik
+      version: "42.x"
+      sourceRef:
+        kind: HelmRepository
+        name: traefik
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    deployment:
+      replicas: 2
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+    ingressClass:
+      enabled: true
+      isDefaultClass: true
+      name: traefik
+    providers:
+      kubernetesCRD:
+        enabled: true
+      kubernetesIngress:
+        enabled: true
+      kubernetesGateway:
+        enabled: false
+    ports:
+      web:
+        port: 8000
+        exposedPort: 80
+        expose:
+          default: true
+        # cloudflared runs in the pod network: trust its X-Forwarded-* headers
+        # (they carry the real visitor IP), nobody else's.
+        forwardedHeaders:
+          trustedIPs:
+            - ${POD_CIDR}
+      websecure:
+        expose:
+          default: false
+    service:
+      spec:
+        type: ClusterIP
+    log:
+      level: INFO
+    # Access log on stdout in Traefik's default (common) format, no headers:
+    # CrowdSec (infrastructure/security) tails it from the pod log files. The
+    # first field is the visitor's address (X-Forwarded-For from cloudflared,
+    # trusted above). otel-logs also ships it with the other pod logs.
+    accessLog:
+      enabled: true
+      format: common
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+            app.kubernetes.io/instance: traefik-traefik

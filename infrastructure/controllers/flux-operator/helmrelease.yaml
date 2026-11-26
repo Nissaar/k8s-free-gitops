@@ -1,0 +1,31 @@
+# Flux Operator, installed once by oracle-always-free's flux-bootstrap.yml with
+#   helm upgrade --install flux-operator ... --namespace flux-system
+# Same release name and namespace here, so helm-controller adopts that release
+# and keeps the operator updated from now on.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: flux-operator
+  namespace: flux-system
+spec:
+  interval: 1h
+  releaseName: flux-operator
+  chartRef:
+    kind: OCIRepository
+    name: flux-operator
+  install:
+    crds: CreateReplace
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    nodeSelector:
+      kubernetes.io/arch: arm64

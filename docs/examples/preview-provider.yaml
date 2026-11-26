@@ -1,0 +1,30 @@
+# Opt an app into PR previews: copy this file to apps/<app>/preview.yaml,
+# replace "myapp" and the values, and list preview.yaml in
+# apps/<app>/kustomization.yaml. Then, in the app's repo:
+#   - CI builds the PR and pushes <image>:pr-<number> (arm64!) on every push;
+#   - add the label "preview" to a PR to get https://pr-<number>-myapp.example.com
+# The previews ResourceSet (infrastructure/configs/previews) does the rest.
+apiVersion: fluxcd.controlplane.io/v1
+kind: ResourceSetInputProvider
+metadata:
+  name: myapp
+  namespace: previews # must be here: the ResourceSet and github-auth live here
+  labels:
+    previews.example.com/enabled: "true"
+  annotations:
+    fluxcd.controlplane.io/reconcileEvery: "5m"
+spec:
+  type: GitHubPullRequest
+  url: https://github.com/<your-github-user>/myapp
+  secretRef:
+    name: github-auth
+  filter:
+    labels:
+      - preview
+    limit: 5
+  defaultValues:
+    app: myapp                     # name in pr-<n>-<app>; lowercase, letters/digits/-
+    image: ghcr.io/your-github-user/myapp   # tag pr-<n> is added by the template
+    port: 8080                     # container port
+    healthPath: /healthz           # must answer 200
+    expectStatus: "200"            # status expected from / (e.g. "302" for a login redirect)

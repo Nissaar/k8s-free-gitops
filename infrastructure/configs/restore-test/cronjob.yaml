@@ -1,0 +1,205 @@
+# Weekly proof that the Home backups restore: Sunday 05:00 local time,
+# after the nightly backup. Steps and scripts: scripts.yaml.
+# Run it now:  kubectl -n restore-test create job --from=cronjob/restore-test restore-test-manual
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: restore-test
+  namespace: restore-test
+spec:
+  schedule: "0 5 * * 0"
+  timeZone: UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 3600
+      # The finished Job and its pod go away after a day; the emptyDirs
+      # (dump + database files) vanish with the pod.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          nodeSelector:
+            kubernetes.io/arch: arm64
+          securityContext:
+            # 999 = postgres in the official image; every step runs as it so
+            # all of them can read and delete each other's files in /work.
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: restore
+              image: docker.io/restic/restic:latest
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/scripts/restore.sh"]
+              env:
+                - name: RESTIC_HOST
+                  value: home
+                # Path inside the snapshot (/nocobase/nocobase.sql.gz on Home).
+                - name: DUMP_PATH
+                  value: nocobase/nocobase.sql.gz
+                - name: AWS_DEFAULT_REGION
+                  value: auto
+                - name: HOME
+                  value: /work
+              envFrom:
+                - secretRef:
+                    name: restore-test
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+            # Native sidecar (restartPolicy: Always): starts after "restore",
+            # stops by itself when "check" and "report" have exited.
+            # The dump comes from pg_dump 18: the server must be 18 or newer,
+            # which the floating :latest is (it only moves forward).
+            - name: postgres
+              image: docker.io/library/postgres:latest
+              imagePullPolicy: Always
+              restartPolicy: Always
+              args:
+                - -c
+                - listen_addresses=127.0.0.1
+                - -c
+                - fsync=off
+                - -c
+                - full_page_writes=off
+                - -c
+                - synchronous_commit=off
+                - -c
+                - shared_buffers=64MB
+              env:
+                # Only reachable on the pod's own loopback, data thrown away.
+                - name: POSTGRES_HOST_AUTH_METHOD
+                  value: trust
+                - name: PGDATA
+                  value: /var/lib/postgresql/data/pgdata
+              startupProbe:
+                exec:
+                  command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+                periodSeconds: 2
+                failureThreshold: 90
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: pgdata, mountPath: /var/lib/postgresql/data }
+                - { name: pgrun, mountPath: /var/run/postgresql }
+                - { name: tmp, mountPath: /tmp }
+          containers:
+            - name: check
+              image: docker.io/library/postgres:latest
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/scripts/check.sh"]
+              env:
+                - name: DB_NAME
+                  value: nocobase
+                - name: DB_ROLES
+                  value: nocobase
+                # Leave empty to pick the biggest table with updatedAt/createdAt.
+                - name: CHECK_TABLE
+                  value: ""
+                - name: CHECK_COLUMN
+                  value: updatedAt
+                # NocoBase is written to daily; a backup older than this fails.
+                - name: MAX_AGE_HOURS
+                  value: "72"
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+            - name: report
+              image: docker.io/curlimages/curl:latest
+              imagePullPolicy: Always
+              command: ["/bin/sh", "/scripts/report.sh"]
+              env:
+                - name: NTFY_HOST
+                  value: ${HOME_TAILNET_FQDN}
+                - name: NTFY_TOPIC
+                  value: ${NTFY_TOPIC}
+                - name: NTFY_VIA
+                  value: ntfy-home.tailscale.svc.cluster.local
+                - name: NTFY_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: restore-test
+                      key: NTFY_TOKEN
+                - name: HEALTHCHECK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: restore-test
+                      key: HEALTHCHECK_URL
+                      optional: true
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - { name: work, mountPath: /work }
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+          volumes:
+            - name: work
+              emptyDir:
+                sizeLimit: 4Gi
+            - name: pgdata
+              emptyDir:
+                sizeLimit: 6Gi
+            - name: pgrun
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Mi
+            - name: tmp
+              emptyDir:
+                sizeLimit: 512Mi
+            - name: scripts
+              configMap:
+                name: restore-test-scripts
+                defaultMode: 0555

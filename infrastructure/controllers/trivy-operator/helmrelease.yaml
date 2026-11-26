@@ -1,0 +1,69 @@
+# Trivy Operator: VulnerabilityReports + ConfigAuditReports for running
+# workloads. Sized for 2 x 6 GB nodes: ONE scan job at a time, the RBAC,
+# infra, compliance, secret and SBOM scanners off. Metrics stay on (service
+# trivy-operator, port 80, /metrics) for a Prometheus later; no
+# ServiceMonitor because no Prometheus Operator runs here.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: trivy-operator
+  namespace: trivy-system
+spec:
+  interval: 1h
+  releaseName: trivy-operator
+  chart:
+    spec:
+      chart: trivy-operator
+      version: "0.x"
+      sourceRef:
+        kind: HelmRepository
+        name: aqua
+        namespace: flux-system
+      interval: 12h
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  values:
+    excludeNamespaces: "kube-system,kube-node-lease,kube-public"
+    operator:
+      scanJobsConcurrentLimit: 1
+      scanNodeCollectorLimit: 1
+      scanJobTimeout: 10m
+      vulnerabilityScannerEnabled: true
+      configAuditScannerEnabled: true
+      rbacAssessmentScannerEnabled: false
+      infraAssessmentScannerEnabled: false
+      clusterComplianceEnabled: false
+      exposedSecretScannerEnabled: false
+      sbomGenerationEnabled: false
+      metricsFindingsEnabled: true
+    serviceMonitor:
+      enabled: false
+    trivyOperator:
+      scanJobNodeSelector:
+        kubernetes.io/arch: arm64
+    trivy:
+      mode: Standalone
+      slow: true
+      severity: MEDIUM,HIGH,CRITICAL
+      resources:
+        requests:
+          cpu: 25m
+          memory: 128M
+        limits:
+          cpu: "1"
+          memory: 1G
+    resources:
+      requests:
+        cpu: 10m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    nodeSelector:
+      kubernetes.io/arch: arm64

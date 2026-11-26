@@ -1,0 +1,13 @@
+# Applied by its own Flux Kustomization "infra-external-secrets" (first layer,
+# clusters/oke/infrastructure.yaml), NOT by infrastructure/controllers: the
+# ExternalSecrets in the controllers layer need these CRDs to exist first.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - helmrepository.yaml
+  - helmrelease.yaml
+  # The ONE SOPS secret left in this repo (the OCI Vault reader's API key).
+  # Added by scripts/seal.sh (oracle-always-free scripts/make-reader-key.sh runs it):
+  # Added by scripts/seal.sh (run by oracle-always-free scripts/make-reader-key.sh):
+  # - oci-vault-reader.sops.yaml

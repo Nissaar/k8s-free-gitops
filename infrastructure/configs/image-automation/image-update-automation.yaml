@@ -1,0 +1,33 @@
+# One automation for the whole repo. Every ImagePolicy in flux-system that a
+# manifest marks with  # {"$imagepolicy": "flux-system:<name>"}  gets its new
+# digest written into that line and committed straight to main.
+# Pushing uses the read/write deploy key in flux-system/flux-git-auth.
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageUpdateAutomation
+metadata:
+  name: flux-system
+  namespace: flux-system
+spec:
+  interval: 30m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: fluxcdbot
+        email: fluxcdbot@users.noreply.github.com
+      messageTemplate: |-
+        chore(images): follow :latest digests
+
+        {{ range .Changed.Changes -}}
+        - {{ .OldValue }} -> {{ .NewValue }}
+        {{ end -}}
+    push:
+      branch: main
+  update:
+    path: ./
+    strategy: Setters

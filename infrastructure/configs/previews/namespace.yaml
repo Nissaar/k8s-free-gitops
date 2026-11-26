@@ -1,0 +1,7 @@
+# Home of the preview machinery: the ResourceSet, the per-app
+# ResourceSetInputProviders (apps/<app>/preview.yaml), the GitHub token and
+# the smoke-test secret/script that get copied into every pr-<n> namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: previews

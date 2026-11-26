@@ -1,0 +1,172 @@
+# OpenTelemetry Collector (contrib), one Deployment: the only way telemetry
+# leaves the cluster. One path per backend, nothing counted twice:
+#
+#   metrics  Prometheus (kube-prometheus-stack) scrapes everything; this
+#            collector reads a chosen subset from Prometheus' /federate
+#            every 60 s (it scrapes no exporter itself) + OTLP from apps
+#   logs     the otel-logs DaemonSet (pod logs) + OTLP from apps
+#   traces   OTLP from apps
+#     -> Grafana Cloud OTLP gateway (Basic auth: instance id + token)
+#     -> New Relic OTLP endpoint (header api-key: license key; counters
+#        turned into deltas, which New Relic prefers)
+#
+# In-cluster OTLP address for apps:
+#   http://otel-gateway.monitoring.svc.cluster.local:4318 (HTTP), :4317 (gRPC)
+#
+# Credentials: env from Secret otel-credentials (OCI Vault
+# "monitoring-otel-credentials", otel-credentials.externalsecret.yaml).
+# Flux substitution is off for this file: ${env:...} is the collector's own
+# syntax and must reach it unchanged.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: otel-gateway
+  namespace: monitoring
+  annotations:
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+spec:
+  interval: 1h
+  releaseName: otel-gateway
+  chart:
+    spec:
+      chart: opentelemetry-collector
+      version: "0.x"
+      sourceRef:
+        kind: HelmRepository
+        name: open-telemetry
+        namespace: flux-system
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    fullnameOverride: otel-gateway
+    mode: deployment
+    replicaCount: 1
+    image:
+      # contrib build: has basicauth, the prometheus receiver and
+      # cumulativetodelta. Tag = the chart's appVersion (follows the chart).
+      repository: docker.io/otel/opentelemetry-collector-contrib
+    command:
+      name: otelcol-contrib
+    extraEnvsFrom:
+      - secretRef:
+          name: otel-credentials
+    resources:
+      requests:
+        cpu: 20m
+        memory: 160Mi
+      limits:
+        cpu: 500m
+        memory: 400Mi
+    nodeSelector:
+      kubernetes.io/arch: arm64
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 10001
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    ports:
+      jaeger-compact:
+        enabled: false
+      jaeger-thrift:
+        enabled: false
+      jaeger-grpc:
+        enabled: false
+      zipkin:
+        enabled: false
+    # The whole collector config (not merged with the chart's defaults).
+    alternateConfig:
+      extensions:
+        health_check:
+          endpoint: ${env:MY_POD_IP}:13133
+        basicauth/grafana:
+          client_auth:
+            username: ${env:GRAFANA_CLOUD_INSTANCE_ID}
+            password: ${env:GRAFANA_CLOUD_TOKEN}
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: ${env:MY_POD_IP}:4317
+            http:
+              endpoint: ${env:MY_POD_IP}:4318
+        # Read from Prometheus, not from the exporters: Prometheus stays the
+        # only scraper. The match[] list keeps Grafana Cloud's free tier
+        # (10k active series) in reach; add a selector here to send more.
+        prometheus/federate:
+          config:
+            scrape_configs:
+              - job_name: federate
+                scrape_interval: 60s
+                scrape_timeout: 30s
+                honor_labels: true
+                metrics_path: /federate
+                params:
+                  match[]:
+                    - '{__name__=~"up|ALERTS"}'
+                    - '{job="node-exporter",__name__=~"node_(cpu_seconds_total|load1|load5|memory_MemAvailable_bytes|memory_MemTotal_bytes|filesystem_avail_bytes|filesystem_size_bytes|network_receive_bytes_total|network_transmit_bytes_total|disk_io_time_seconds_total|boot_time_seconds)"}'
+                    - '{job="kube-state-metrics",__name__=~"kube_(node_status_condition|node_status_allocatable|pod_status_phase|pod_container_status_restarts_total|pod_container_status_waiting_reason|pod_container_resource_requests|pod_container_resource_limits|deployment_spec_replicas|deployment_status_replicas_available|daemonset_status_number_unavailable|statefulset_status_replicas_ready|job_status_failed|cronjob_status_last_successful_time|persistentvolumeclaim_status_phase)"}'
+                    - '{job="kubelet",__name__=~"container_cpu_usage_seconds_total|container_memory_working_set_bytes|kubelet_volume_stats_available_bytes|kubelet_volume_stats_capacity_bytes",container!=""}'
+                static_configs:
+                  - targets: ["kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"]
+      processors:
+        memory_limiter:
+          check_interval: 5s
+          limit_percentage: 80
+          spike_limit_percentage: 25
+        batch:
+          send_batch_size: 2048
+          timeout: 10s
+        resource/cluster:
+          attributes:
+            - key: k8s.cluster.name
+              value: oke-free
+              action: upsert
+        cumulativetodelta: {}
+      exporters:
+        otlphttp/grafana:
+          endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}
+          auth:
+            authenticator: basicauth/grafana
+          compression: gzip
+        otlphttp/newrelic:
+          endpoint: ${env:NEW_RELIC_OTLP_ENDPOINT}
+          headers:
+            api-key: ${env:NEW_RELIC_LICENSE_KEY}
+          compression: gzip
+      service:
+        extensions: [health_check, basicauth/grafana]
+        telemetry:
+          metrics:
+            level: basic
+            readers:
+              - pull:
+                  exporter:
+                    prometheus:
+                      host: ${env:MY_POD_IP}
+                      port: 8888
+        pipelines:
+          metrics/grafana:
+            receivers: [otlp, prometheus/federate]
+            processors: [memory_limiter, resource/cluster, batch]
+            exporters: [otlphttp/grafana]
+          metrics/newrelic:
+            receivers: [otlp, prometheus/federate]
+            processors: [memory_limiter, resource/cluster, cumulativetodelta, batch]
+            exporters: [otlphttp/newrelic]
+          logs:
+            receivers: [otlp]
+            processors: [memory_limiter, resource/cluster, batch]
+            exporters: [otlphttp/grafana, otlphttp/newrelic]
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, resource/cluster, batch]
+            exporters: [otlphttp/grafana, otlphttp/newrelic]

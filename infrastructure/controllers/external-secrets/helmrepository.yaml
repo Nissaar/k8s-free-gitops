@@ -1,0 +1,10 @@
+# Kept here, not in controllers/sources: this layer runs before
+# infra-controllers, which applies sources/.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: external-secrets
+  namespace: flux-system
+spec:
+  interval: 12h
+  url: https://charts.external-secrets.io

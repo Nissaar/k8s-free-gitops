@@ -1,0 +1,56 @@
+# Default StorageClass "local-path": volumes are directories on the node's boot
+# volume (/opt/local-path-provisioner). Free, but tied to one node: a pod with
+# a local-path PVC always comes back on the same node.
+# OKE also ships "oci-bv" (paid-ish block volumes, 50 GB minimum each); see
+# docs/WHAT-YOU-DO.md for making sure it is not the default too.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: local-path-provisioner
+  namespace: local-path-storage
+spec:
+  interval: 1h
+  releaseName: local-path-provisioner
+  chart:
+    spec:
+      chart: ./deploy/chart/local-path-provisioner
+      sourceRef:
+        kind: GitRepository
+        name: local-path-provisioner
+        namespace: flux-system
+      interval: 12h
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  values:
+    storageClass:
+      create: true
+      defaultClass: true
+      name: local-path
+      reclaimPolicy: Delete
+      volumeBindingMode: WaitForFirstConsumer
+    nodePathMap:
+      - node: DEFAULT_PATH_FOR_NON_LISTED_NODES
+        paths:
+          - /opt/local-path-provisioner
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 200m
+        memory: 64Mi
+    # The short-lived helper pods that create/delete volume directories.
+    helperPod:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 8Mi
+        limits:
+          cpu: 100m
+          memory: 32Mi
+    nodeSelector:
+      kubernetes.io/arch: arm64

@@ -1,0 +1,27 @@
+# Default ProxyClass for every proxy the operator creates (set in the chart:
+# proxyConfig.defaultProxyClass). Keeps proxy pods small and on arm64.
+apiVersion: tailscale.com/v1alpha1
+kind: ProxyClass
+metadata:
+  name: small
+spec:
+  statefulSet:
+    pod:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tailscaleContainer:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 300m
+            memory: 128Mi
+      tailscaleInitContainer:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 8Mi
+          limits:
+            cpu: 100m
+            memory: 32Mi

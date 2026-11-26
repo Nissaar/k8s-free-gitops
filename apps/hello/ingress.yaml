@@ -1,0 +1,22 @@
+# hello.example.com is a tunnel hostname in cloudflare-free (cluster_hostnames,
+# private: Cloudflare Access login, or the ci-smoke-tests service token).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello
+  namespace: hello
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: hello.${BASE_DOMAIN}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hello
+                port:
+                  name: http

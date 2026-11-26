@@ -1,0 +1,71 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "UTC",
+  "schedule": [
+    "before 7am on monday"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "prConcurrentLimit": 5,
+  "automerge": false,
+  "dependencyDashboard": true,
+  "enabledManagers": [
+    "github-actions",
+    "custom.regex"
+  ],
+  "customManagers": [
+    {
+      "description": "kubectl used in CI",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/validate\\.yml$/"],
+      "matchStrings": ["KUBECTL_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "kubernetes/kubernetes",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "kubeconform used in CI",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/validate\\.yml$/"],
+      "matchStrings": ["KUBECONFORM_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "yannh/kubeconform",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "flux-operator CLI used in CI",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/validate\\.yml$/"],
+      "matchStrings": ["FLUX_OPERATOR_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "controlplaneio-fluxcd/flux-operator",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "Trivy binary used in CI",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/validate\\.yml$/"],
+      "matchStrings": ["TRIVY_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One PR for all github actions minor and patch updates; majors stay separate",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "groupName": "github actions minor and patch updates"
+    },
+    {
+      "description": "Label majors so they stand out; read the release notes before merging",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major"]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# external-secrets/ is NOT listed: it is its own layer (infra-external-secrets),
+# applied before this one so the ExternalSecret CRDs exist here.
+resources:
+  - sources
+  - secret-store
+  - flux-operator
+  - local-path
+  - traefik
+  - cloudflared
+  - tailscale
+  - kyverno
+  - trivy-operator

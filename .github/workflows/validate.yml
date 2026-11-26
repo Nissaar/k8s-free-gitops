@@ -1,0 +1,81 @@
+name: validate
+
+# PR (and main, where image automation commits) -> render and check manifests:
+#   manifests: kustomize build of every Flux Kustomization path, the previews
+#              ResourceSet rendered with mock PRs, kubeconform with CRD schemas
+#   trivy:     trivy config (accepted findings: .trivyignore.yaml)
+# Nothing here touches the cluster; Flux applies main by itself.
+# Failures are pulled by ChatOps (infra channel), not pushed to ntfy.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KUBECTL_VERSION: v1.37.2
+  KUBECONFORM_VERSION: v0.8.0
+  FLUX_OPERATOR_VERSION: v0.62.1
+  TRIVY_VERSION: v0.76.1
+
+jobs:
+  manifests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing here pushes: no token left in .git/config
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install kubeconform and the flux-operator CLI (checksums verified)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          base=https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION
+          curl -fsSLO "$base/kubeconform-linux-amd64.tar.gz"
+          curl -fsSLO "$base/CHECKSUMS"
+          grep ' kubeconform-linux-amd64.tar.gz$' CHECKSUMS | sha256sum -c -
+          tar xzf kubeconform-linux-amd64.tar.gz -C bin kubeconform
+
+          v=${FLUX_OPERATOR_VERSION#v}
+          base=https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/$FLUX_OPERATOR_VERSION
+          curl -fsSLO "$base/flux-operator_${v}_linux_amd64.tar.gz"
+          curl -fsSLO "$base/flux-operator_${v}_checksums.txt"
+          grep " flux-operator_${v}_linux_amd64.tar.gz$" "flux-operator_${v}_checksums.txt" | sha256sum -c -
+          tar xzf "flux-operator_${v}_linux_amd64.tar.gz" -C bin flux-operator
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: kustomize build + ResourceSet render + kubeconform
+        run: scripts/validate.sh
+
+      - name: shellcheck the scripts
+        run: shellcheck scripts/*.sh
+
+  trivy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing here pushes: no token left in .git/config
+      # Pinned by commit: trivy-action tags were hijacked in March 2026 (CVE-2026-33634).
+      - name: trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: .
+          trivyignores: .trivyignore.yaml
+          severity: MEDIUM,HIGH,CRITICAL
+          exit-code: "1"
+          hide-progress: true

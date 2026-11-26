@@ -1,0 +1,15 @@
+# SOPS rules for this repo (age, same model as your age/sops notes).
+#
+# Only *.sops.yaml files are encrypted, and only their data/stringData values:
+# apiVersion/kind/metadata stay readable so kustomize and Flux can handle them.
+# Flux decrypts them in-cluster with the private key in flux-system/sops-age.
+#
+# Replace the placeholder with YOUR public key (age-keygen -y <keyfile>), and
+# add a second recipient line for a backup key if you keep one. Public keys
+# are not secret.
+creation_rules:
+  - path_regex: \.sops\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    key_groups:
+      - age:
+          - age1REPLACE_WITH_YOUR_PUBLIC_KEY

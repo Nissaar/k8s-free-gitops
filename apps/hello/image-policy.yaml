@@ -1,0 +1,28 @@
+# Follow traefik/whoami:latest by digest (the "always :latest" rule, but every
+# change of the image is a git commit you can see and revert).
+# Both objects live in flux-system: the ImageUpdateAutomation only uses
+# policies from its own namespace.
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageRepository
+metadata:
+  name: hello
+  namespace: flux-system
+spec:
+  image: docker.io/traefik/whoami
+  interval: 6h # tag list; Docker Hub rate-limits anonymous pulls
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImagePolicy
+metadata:
+  name: hello
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: hello
+  filterTags:
+    pattern: '^latest$'
+  policy:
+    alphabetical:
+      order: asc
+  digestReflectionPolicy: Always
+  interval: 1h # how often the digest of :latest is re-checked

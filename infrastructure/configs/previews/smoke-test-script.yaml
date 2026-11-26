@@ -1,0 +1,67 @@
+# Smoke test run by the Job that the previews ResourceSet creates for each new
+# commit of a PR. Copied into pr-<n> namespaces (copyFrom).
+#
+# Env: URL HEALTH_PATH EXPECT_STATUS APP PR SHA TIMEOUT_SECONDS
+#      NTFY_HOST NTFY_TOPIC NTFY_VIA, and from the secret preview-smoke:
+#      CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET NTFY_TOKEN
+# The script uses $VAR, never ${VAR}: Flux would substitute that.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smoke-test
+  namespace: previews
+  labels:
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+    reconcile.fluxcd.io/watch: Enabled
+data:
+  smoke-test.sh: |
+    #!/bin/sh
+    # Load the preview through Cloudflare (tunnel + Access service token),
+    # check the status of / and of the health path, report to ntfy.
+    [ -n "$HEALTH_PATH" ] || HEALTH_PATH=/
+    [ -n "$TIMEOUT_SECONDS" ] || TIMEOUT_SECONDS=300
+    [ -n "$EXPECT_STATUS" ] || EXPECT_STATUS=200
+
+    status() {
+      curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+        -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+        "$1" 2>/dev/null || echo 000
+    }
+
+    notify() { # title priority tags message
+      if [ -z "$NTFY_HOST" ] || [ -z "$NTFY_TOKEN" ]; then
+        echo "ntfy not configured, skipping"; return 0
+      fi
+      # Tag "chatops" so the ChatOps listener does not read it as a command.
+      curl -sS -o /dev/null --max-time 20 \
+        --connect-to "$NTFY_HOST:443:$NTFY_VIA:443" \
+        -H "Authorization: Bearer $NTFY_TOKEN" \
+        -H "Title: $1" -H "Priority: $2" -H "Tags: chatops,$3" \
+        -d "$4" "https://$NTFY_HOST/$NTFY_TOPIC" || echo "ntfy post failed"
+    }
+
+    short=$(printf '%s' "$SHA" | cut -c1-7)
+    deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+    root=000; health=000
+    while :; do
+      root=$(status "$URL/")
+      health=$(status "$URL$HEALTH_PATH")
+      echo "$(date -u +%H:%M:%S) $URL/ -> $root, $HEALTH_PATH -> $health"
+      if [ "$root" = "$EXPECT_STATUS" ] && [ "$health" = "200" ]; then
+        notify "Preview OK: $APP PR #$PR" 3 "white_check_mark" \
+          "$URL ($short): / -> $root, $HEALTH_PATH -> $health"
+        exit 0
+      fi
+      [ "$(date +%s)" -ge "$deadline" ] && break
+      sleep 15
+    done
+    hint=""
+    case "$root" in
+      302|403) hint=" (Cloudflare Access refused the service token?)" ;;
+      000) hint=" (no answer: DNS/tunnel?)" ;;
+      404) hint=" (tunnel reached, no route: Ingress/Traefik?)" ;;
+    esac
+    notify "Preview FAILED: $APP PR #$PR" 4 "x" \
+      "$URL ($short): / -> $root (want $EXPECT_STATUS), $HEALTH_PATH -> $health$hint"
+    exit 1
